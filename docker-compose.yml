@@ -1,0 +1,40 @@
+version: '3.8'
+
+volumes:
+  n8n_oss_storage:
+  postgres_oss_storage:
+
+networks:
+  oss_demo:
+
+services:
+  postgres-oss:
+    image: postgres:16-alpine
+    networks: ['oss_demo']
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: n8n
+      POSTGRES_DB: n8n
+    volumes:
+      - postgres_oss_storage:/var/lib/postgresql/data
+
+  n8n-oss:
+    image: n8nio/n8n:latest
+    networks: ['oss_demo']
+    restart: unless-stopped
+    ports:
+        - 5678:5678
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres-oss
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: n8n
+      N8N_ENCRYPTION_KEY: a_secure_encryption_key
+      N8N_EDITOR_BASE_URL: https://unprotruding-niveous-brigida.ngrok-free.dev
+      WEBHOOK_URL: https://unprotruding-niveous-brigida.ngrok-free.dev/
+      N8N_PROXY_HOPS: 1
+    volumes:
+      - n8n_oss_storage:/home/node/.n8n
