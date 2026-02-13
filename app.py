@@ -1,6 +1,6 @@
  #  Start by making sure the `websocket-client` and `pyaudio` packages are installed.
 # If not, you can install it by running the following command:
-# pip install websocket-client pyaudio
+# pip install websocket-client pyaudio supabase python-dotenv
 
 import os
 import ssl
@@ -14,11 +14,37 @@ from urllib.parse import urlencode
 from datetime import datetime
 import certifi
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("Warning: python-dotenv not installed. Run: pip install python-dotenv")
+
+try:
+    from supabase import create_client, Client
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    SUPABASE_AVAILABLE = False
+    print("Warning: supabase package not installed. Run: pip install supabase")
+
 # Replace with your chosen API key, this is the "default" account api key
-API_KEY = "YOUR_API_KEY"
+API_KEY = "0bcfdb832dd94ceda407053fd06c075c"
+
+# Supabase Configuration
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")  # Add your Supabase URL
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # Add your Supabase anon/service key
+SUPABASE_TABLE = "transcripts"  # Table name in Supabase
+
+# Auto-save configuration
+AUTO_SAVE_INTERVAL = 60  # Save JSON file every 1 minute (in seconds)
+AUTO_SAVE_TRANSCRIPT_COUNT = 50  # Or save after 50 transcripts, whichever comes first
+
 CONNECTION_PARAMS = {
     "sample_rate": 16000,
-    "format_turns": True
+    "format_turns": True,
+    "enable_extra_session_information": True,
+    "entity_detection": True  # Enable brand/entity detection
 }
 API_ENDPOINT_BASE_URL = "wss://streaming.assemblyai.com/v3/ws"
 API_ENDPOINT = f"{API_ENDPOINT_BASE_URL}?{urlencode(CONNECTION_PARAMS)}"
@@ -40,12 +66,42 @@ stop_event = threading.Event()  # To signal the audio thread to stop
 recorded_frames = []  # Store audio frames for WAV file
 recording_lock = threading.Lock()  # Thread-safe access to recorded_frames
 
+# Transcript storage
+transcript_data = []  # Temporary storage for periodic JSON saves
+transcript_lock = threading.Lock()
+session_start_time = None
+session_id = None
+last_save_time = None
+transcript_count = 0
+
+# Supabase client
+supabase_client = None
+
+# Auto-save thread
+auto_save_thread = None
+
 # --- WebSocket Event Handlers ---
 
 def on_open(ws):
     """Called when the WebSocket connection is established."""
+    global last_save_time, supabase_client
     print("WebSocket connection opened.")
     print(f"Connected to: {API_ENDPOINT}")
+    last_save_time = time.time()
+    
+    # Initialize Supabase client
+    if SUPABASE_AVAILABLE and SUPABASE_URL and SUPABASE_KEY:
+        try:
+            supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            print("✅ Supabase connected - real-time uploads enabled")
+        except Exception as e:
+            print(f"⚠️  Supabase connection failed: {e}")
+            supabase_client = None
+    else:
+        print("⚠️  Supabase not configured - only local JSON saves will work")
+    
+    # Start auto-save thread
+    start_auto_save_thread()
 
     # Start sending audio data in a separate thread
     def stream_audio():
@@ -75,6 +131,7 @@ def on_open(ws):
     audio_thread.start()
 
 def on_message(ws, message):
+    global session_id, session_start_time, transcript_count
     try:
         data = json.loads(message)
         msg_type = data.get('type')
@@ -82,22 +139,60 @@ def on_message(ws, message):
         if msg_type == "Begin":
             session_id = data.get('id')
             expires_at = data.get('expires_at')
+            session_start_time = datetime.now()
             print(f"\nSession began: ID={session_id}, ExpiresAt={datetime.fromtimestamp(expires_at)}")
+            print(f"Auto-save: Every {AUTO_SAVE_INTERVAL//60} minutes OR {AUTO_SAVE_TRANSCRIPT_COUNT} transcripts\n")
+            
         elif msg_type == "Turn":
             transcript = data.get('transcript', '')
             formatted = data.get('turn_is_formatted', False)
+            entities = data.get('entities', [])
 
-            # For continuous radio/TV monitoring: show all updates
-            # Formatted = final clean transcript, unformatted = real-time partial
-            if formatted:
-                print(f"\n[FINAL] {transcript}")
+            if formatted and transcript.strip():  # Only process non-empty formatted transcripts
+                # Extract brands from entities
+                brands = []
+                for entity in entities:
+                    entity_type = entity.get('entity_type', '').lower()
+                    if entity_type in ['organization', 'product', 'brand', 'company']:
+                        brands.append({
+                            'name': entity.get('text'),
+                            'type': entity_type,
+                            'confidence': entity.get('confidence', 0)
+                        })
+                
+                # Create structured transcript entry
+                transcript_entry = {
+                    'timestamp': datetime.now().isoformat(),
+                    'session_id': session_id,
+                    'transcript': transcript,
+                    'brands': brands,
+                    'entities': entities,
+                    'word_count': len(transcript.split())
+                }
+                
+                # Store in memory for periodic saves
+                with transcript_lock:
+                    transcript_data.append(transcript_entry)
+                    transcript_count += 1
+                
+                # Upload to Supabase immediately
+                upload_to_supabase_realtime(transcript_entry)
+                
+                # Display
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {transcript}")
+                if brands:
+                    brand_names = ', '.join([b['name'] for b in brands])
+                    print(f"  🏷️  BRANDS: {brand_names}")
+                
             else:
-                # Use \r to overwrite the same line for live updates
+                # Live updates (partial transcripts)
                 print(f"\r[LIVE] {transcript}", end='', flush=True)
+                
         elif msg_type == "Termination":
             audio_duration = data.get('audio_duration_seconds', 0)
             session_duration = data.get('session_duration_seconds', 0)
             print(f"\nSession Terminated: Audio Duration={audio_duration}s, Session Duration={session_duration}s")
+            
     except json.JSONDecodeError as e:
         print(f"Error decoding message: {e}")
     except Exception as e:
@@ -113,12 +208,15 @@ def on_close(ws, close_status_code, close_msg):
     """Called when the WebSocket connection is closed."""
     print(f"\nWebSocket Disconnected: Status={close_status_code}, Msg={close_msg}")
 
+    # Final save of any remaining transcripts
+    save_json_file(final=True)
+    
     # Save recorded audio to WAV file
     save_wav_file()
 
     # Ensure audio resources are released
     global stream, audio
-    stop_event.set()  # Signal audio thread just in case it's still running
+    stop_event.set()  # Signal audio thread and auto-save thread to stop
 
     if stream:
         if stream.is_active():
@@ -131,6 +229,93 @@ def on_close(ws, close_status_code, close_msg):
     # Try to join the audio thread to ensure clean exit
     if audio_thread and audio_thread.is_alive():
         audio_thread.join(timeout=1.0)
+
+def upload_to_supabase_realtime(transcript_entry):
+    """Upload a single transcript to Supabase immediately."""
+    if not supabase_client:
+        return  # Skip if not configured
+    
+    try:
+        data = {
+            'session_id': transcript_entry['session_id'],
+            'timestamp': transcript_entry['timestamp'],
+            'transcript': transcript_entry['transcript'],
+            'brands': json.dumps(transcript_entry['brands']),
+            'entities': json.dumps(transcript_entry['entities']),
+            'word_count': transcript_entry['word_count']
+        }
+        supabase_client.table(SUPABASE_TABLE).insert(data).execute()
+    except Exception as e:
+        # Silently log errors to avoid cluttering output
+        pass  # You can uncomment below for debugging
+        # print(f"\n⚠️  Supabase upload error: {e}")
+
+def start_auto_save_thread():
+    """Start background thread for periodic JSON saves."""
+    global auto_save_thread
+    
+    def auto_save_loop():
+        global last_save_time, transcript_count
+        while not stop_event.is_set():
+            time.sleep(5)  # Check every 5 seconds
+            
+            current_time = time.time()
+            time_elapsed = current_time - last_save_time
+            
+            # Save if time interval reached OR transcript count reached
+            should_save = (
+                time_elapsed >= AUTO_SAVE_INTERVAL or 
+                transcript_count >= AUTO_SAVE_TRANSCRIPT_COUNT
+            )
+            
+            if should_save and transcript_data:
+                save_json_file(final=False)
+                last_save_time = current_time
+    
+    auto_save_thread = threading.Thread(target=auto_save_loop, daemon=True)
+    auto_save_thread.start()
+
+def save_json_file(final=False):
+    """Save transcripts to a JSON file and clear memory."""
+    global transcript_count
+    
+    if not transcript_data:
+        return
+
+    # Generate filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"transcripts_{timestamp}.json"
+
+    try:
+        with transcript_lock:
+            output_data = {
+                'metadata': {
+                    'session_id': session_id,
+                    'session_start': session_start_time.isoformat() if session_start_time else None,
+                    'file_created': datetime.now().isoformat(),
+                    'total_transcripts': len(transcript_data),
+                    'is_final': final
+                },
+                'transcripts': transcript_data.copy()  # Copy current data
+            }
+
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
+
+        status = "FINAL" if final else "AUTO-SAVE"
+        print(f"\n\n{'='*60}")
+        print(f"💾 [{status}] JSON saved: {filename}")
+        print(f"📊 Transcripts in file: {len(transcript_data)}")
+        print(f"{'='*60}\n")
+
+        # Clear memory after successful save (but not on final save)
+        if not final:
+            with transcript_lock:
+                transcript_data.clear()
+                transcript_count = 0
+
+    except Exception as e:
+        print(f"\n❌ Error saving JSON file: {e}")
 
 def save_wav_file():
     """Save recorded audio frames to a WAV file."""
@@ -152,7 +337,7 @@ def save_wav_file():
             with recording_lock:
                 wf.writeframes(b''.join(recorded_frames))
 
-        print(f"Audio saved to: {filename}")
+        print(f"🎵 Audio saved to: {filename}")
         print(f"Duration: {len(recorded_frames) * FRAMES_PER_BUFFER / SAMPLE_RATE:.2f} seconds")
 
     except Exception as e:
