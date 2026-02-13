@@ -29,7 +29,7 @@ except ImportError:
     print("Warning: supabase package not installed. Run: pip install supabase")
 
 # Replace with your chosen API key, this is the "default" account api key
-API_KEY = "0bcfdb832dd94ceda407053fd06c075c"
+API_KEY = "api"
 
 # Supabase Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")  # Add your Supabase URL
